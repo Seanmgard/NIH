@@ -96,7 +96,7 @@ nih_post <- function(client, payload) {
       error = function(e) e
     )
     st$last_call <- as.numeric(Sys.time())
-    
+
     if (inherits(resp, "error")) {
       last_err <- conditionMessage(resp)
       backoff <- min(2^attempt, 30)
@@ -104,7 +104,7 @@ nih_post <- function(client, payload) {
                       last_err, attempt, client$max_retries, backoff))
       Sys.sleep(backoff); next
     }
-    
+
     code <- httr::status_code(resp)
     if (code == 200) {
       txt <- httr::content(resp, as = "text", encoding = "UTF-8")
@@ -172,7 +172,7 @@ nih_iter_all <- function(client, criteria, include_fields = NULL,
     message(sprintf("fetching %d records", total))
     return(nih_paginate(client, criteria, include_fields, page_size, total, callback))
   }
-  
+
   rng <- criteria$award_notice_date
   if (!is.null(rng)) {
     yrs <- .notice_years(rng)
@@ -188,7 +188,7 @@ nih_iter_all <- function(client, criteria, include_fields = NULL,
       return(invisible(n))
     }
   }
-  
+
   message(sprintf("%d records > %d for a single slice; splitting by award amount",
                   total, MAX_RESULT_SET))
   .split_by_amount(client, criteria, include_fields, page_size,
@@ -213,12 +213,12 @@ nih_iter_all <- function(client, criteria, include_fields = NULL,
   amt <- list(min_amount = low)
   if (!is.null(high)) amt$max_amount <- high
   sub$award_amount_range <- amt
-  
+
   total <- nih_count(client, sub)
   if (total == 0) return(invisible(0L))
   if (total <= MAX_RESULT_SET)
     return(nih_paginate(client, sub, include_fields, page_size, total, callback))
-  
+
   if (is.null(high)) {                       # unbounded top band: probe upward
     high2 <- max(low * 2, 1000000)
     n1 <- .split_by_amount(client, criteria, include_fields, page_size, low, high2, callback)
@@ -248,6 +248,13 @@ notice_year_range <- function(year) {
 notice_span_range <- function(years) {
   list(from_date = sprintf("%d-01-01", min(as.integer(years))),
        to_date   = sprintf("%d-12-31", max(as.integer(years))))
+}
+# One calendar month's award-notice window, e.g. notice_month_range(2024, 3)
+# -> 2024-03-01 to 2024-03-31 (handles month length / leap years correctly).
+notice_month_range <- function(year, month) {
+  first <- as.Date(sprintf("%d-%02d-01", as.integer(year), as.integer(month)))
+  last  <- seq(first, by = "1 month", length.out = 2)[2] - 1
+  list(from_date = format(first, "%Y-%m-%d"), to_date = format(last, "%Y-%m-%d"))
 }
 
 # Build criteria matching `term` in the given field(s).
@@ -321,7 +328,7 @@ flatten_record <- function(rec) {
       collapse = "; ") else ""
   admin <- rec$agency_ic_admin %||% list()
   fss   <- rec$full_study_section
-  
+
   list(
     appl_id                = .nz(rec$appl_id),
     subproject_id          = .nz(rec$subproject_id),
