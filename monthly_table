@@ -1,0 +1,85 @@
+# monthly_table.R
+# =============================================================================
+# Build a wide table: rows = terms, columns = month/year, values = counts (or
+# funding) of projects whose AWARD NOTICE DATE falls in that calendar month.
+#
+# Usage:
+#   source("nih_reporter.R"); source("search_terms.R"); source("monthly_table.R")
+#   client <- new_client()
+#
+#   # Counts, Jan 2023 through the most recently completed month
+#   tbl <- monthly_term_table(client, terms = c("NovaSeq X","Illumina","PacBio"),
+#                             start_year = 2023, start_month = 1)
+#
+#   # Dollar totals instead of counts (slower -- downloads matching records;
+#   # excludes subproject rows, same convention as term_funding())
+#   tbl <- monthly_term_table(client, metric = "funding",
+#                             start_year = 2023, start_month = 1)
+#
+#   write.csv(tbl, "monthly_term_table.csv", row.names = FALSE)
+# =============================================================================
+
+if (!exists("nih_count")) stop("source('nih_reporter.R') first")
+
+.DEFAULT_MONTHLY_TERMS <- if (exists("DEFAULT_TERMS")) DEFAULT_TERMS else
+  c("NovaSeq X", "Illumina", "PacBio")
+
+# Sum award_amount for one term in one calendar month, excluding subproject
+# rows (mirrors term_funding()'s convention -- see search_terms.R).
+.month_funding <- function(client, term, rng, cost_field = "award_amount") {
+  acc <- new.env(parent = emptyenv()); acc$total <- 0
+  crit <- text_search_criteria(term, ALL_TEXT_FIELDS, rng)
+  nih_iter_all(client, crit,
+               include_fields = c("ProjectNum", "SubprojectId", "AwardAmount"),
+               callback = function(rec) {
+                 sid <- rec$subproject_id
+                 is_sub <- !is.null(sid) && !is.na(sid) && nzchar(as.character(sid))
+                 if (is_sub) return(invisible(NULL))
+                 acc$total <- acc$total + (rec[[cost_field]] %||% rec$award_amount %||% 0)
+               })
+  acc$total
+}
+
+# Build the rows = terms x columns = "Mon YYYY" table.
+#
+# metric: "count"   (default) - one API call per term-month, fast.
+#         "funding" - downloads matching records per term-month, sums
+#                     award_amount excluding subprojects; much slower.
+# end_year/end_month default to the most recently completed calendar month.
+monthly_term_table <- function(client, terms = .DEFAULT_MONTHLY_TERMS,
+                               start_year, start_month = 1L,
+                               end_year = NULL, end_month = NULL,
+                               metric = c("count", "funding"),
+                               cost_field = "award_amount") {
+  metric <- match.arg(metric)
+  today <- Sys.Date()
+  if (is.null(end_year))  end_year  <- as.integer(format(today, "%Y"))
+  if (is.null(end_month)) end_month <- as.integer(format(today, "%m")) - 1L
+  if (end_month < 1L) { end_month <- 12L; end_year <- end_year - 1L }  # roll back if Jan
+
+  months <- seq(as.Date(sprintf("%d-%02d-01", start_year, start_month)),
+               as.Date(sprintf("%d-%02d-01", end_year, end_month)),
+               by = "1 month")
+  col_labels <- format(months, "%b %Y")
+
+  mat <- matrix(NA_real_, nrow = length(terms), ncol = length(months),
+               dimnames = list(terms, col_labels))
+
+  for (mi in seq_along(months)) {
+    y <- as.integer(format(months[mi], "%Y")); m <- as.integer(format(months[mi], "%m"))
+    rng <- notice_month_range(y, m)
+    message(sprintf("[%s] querying %d term(s)...", col_labels[mi], length(terms)))
+    for (t in terms) {
+      mat[t, mi] <- if (metric == "count") {
+        nih_count(client, text_search_criteria(t, ALL_TEXT_FIELDS, rng))
+      } else {
+        .month_funding(client, t, rng, cost_field)
+      }
+    }
+  }
+
+  out <- as.data.frame(mat, check.names = FALSE)
+  out <- cbind(term = rownames(out), out)
+  rownames(out) <- NULL
+  out
+}
