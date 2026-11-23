@@ -153,12 +153,17 @@ nih_request <- function(client, payload) {
     if (!inherits(response, "error")) {
       code <- httr::status_code(response)
       if (code == 200) {
-        parsed <- jsonlite::fromJSON(httr::content(response, as = "text", encoding = "UTF-8"),
-                                    simplifyVector = FALSE)
+        body <- httr::content(response, as = "text", encoding = "UTF-8")
+        if (grepl("^\\s*<", body, perl = TRUE))
+          abort("RePORTER returned HTTP 200 with a web page instead of JSON. ",
+                "Check the POST endpoint and your organization's approved network settings.")
+        parsed <- jsonlite::fromJSON(body, simplifyVector = FALSE)
         if (length(parsed$meta$total) != 1 || !is.numeric(parsed$meta$total) ||
             is.null(parsed$results)) abort("NIH returned an unexpected response schema.")
         return(parsed)
       }
+      if (code == 407L)
+        abort("HTTP 407: the network proxy requires authentication. Ask IT for the approved R proxy configuration.")
       if (!code %in% c(429, 500, 502, 503, 504)) httr::stop_for_status(response)
     }
     reason <- if (inherits(response, "error")) conditionMessage(response) else paste("HTTP", code)
@@ -176,32 +181,69 @@ nih_request <- function(client, payload) {
   }
 }
 
-nih_page <- function(client, criteria, offset = 0L, limit = 500L) {
+nih_page <- function(client, criteria, offset = 0L, limit = 500L, order = "asc") {
   nih_request(client, list(criteria = criteria, offset = offset, limit = limit,
-                           sort_field = "appl_id", sort_order = "asc"))
+                           sort_field = "appl_id", sort_order = order))
 }
 
 fetch_projects <- function(client, criteria) {
+  # A conservative window works with both the historical 10k boundary and v2.
+  window <- 10000L
   first <- nih_page(client, criteria)
   total <- first$meta$total
-  if (total > 15000L) {
-    if (length(criteria$agencies) <= 1L)
-      abort("A single institute has more than 15,000 matches. Narrow the phrase or activity codes. Use NIH ExPORTER for a bulk census.")
-    records <- map(criteria$agencies, function(ic) {
-      part <- criteria
-      part$agencies <- list(ic)
-      fetch_projects(client, part)$records
-    }) |> flatten()
-  } else {
-    records <- first$results
-    offset <- length(records)
-    while (offset < total) {
-      page <- nih_page(client, criteria, offset, min(500L, total - offset))
+
+  read_pages <- function(page, count, order) {
+    rows <- page$results
+    if (page$meta$total != total || length(rows) > count)
+      abort("NIH counts changed during pagination. Rerun the extract.")
+    while (length(rows) < count) {
+      offset <- length(rows)
+      page <- nih_page(client, criteria, offset, min(500L, count - offset), order)
       if (page$meta$total != total || !length(page$results))
         abort("NIH changed during pagination or a page was missing. Rerun the extract.")
-      records <- c(records, page$results)
-      offset <- length(records)
+      rows <- c(rows, page$results)
     }
+    rows
+  }
+
+  if (total <= window) {
+    records <- read_pages(first, total, "asc")
+  } else if (length(criteria$fiscal_years) > 1L || length(criteria$agencies) > 1L) {
+    field <- if (length(criteria$fiscal_years) > 1L) "fiscal_years" else "agencies"
+    values <- criteria[[field]]
+    cut <- ceiling(length(values) / 2)
+    groups <- list(head(values, cut), tail(values, length(values) - cut))
+    message("Splitting ", total, " matches by ", field, ".")
+    records <- map(groups, function(group) {
+      part <- criteria
+      part[[field]] <- group
+      fetch_projects(client, part)$records
+    }) |> flatten()
+  } else if (total <= 2L * window) {
+    # Application ID is unique: the lowest 10k and highest remainder are disjoint.
+    low <- read_pages(first, window, "asc")
+    remaining <- total - window
+    last <- nih_page(client, criteria, limit = min(500L, remaining), order = "desc")
+    records <- c(low, rev(read_pages(last, remaining, "desc")))
+  } else {
+    # Rare single-institute, single-FY case. Explicit application-ID batches
+    # cover missing dates and missing/zero award amounts without guessing ranges.
+    last <- nih_page(client, criteria, limit = 1L, order = "desc")
+    if (last$meta$total != total) abort("NIH count changed before ID partitioning.")
+    low <- as.integer(first$results[[1]]$appl_id)
+    high <- as.integer(last$results[[1]]$appl_id)
+    if (is.na(low) || is.na(high) || high - low + 1 < total)
+      abort("NIH returned invalid application-ID bounds.")
+    message("Retrieving ", total, " matches in explicit application-ID batches.")
+    records <- map(seq(low, high, by = 500L), function(start) {
+      part <- criteria
+      part$appl_ids <- as.list(seq.int(start, min(high, start + 499L)))
+      batch <- nih_page(client, part)
+      ids <- map_int(batch$results, "appl_id")
+      if (length(ids) != batch$meta$total || any(!ids %in% unlist(part$appl_ids)))
+        abort("NIH did not return the requested application-ID batch.")
+      batch$results
+    }) |> flatten()
   }
   ids <- map_chr(records, ~as.character(.x$appl_id %||% NA))
   if (length(records) != total || anyNA(ids) || anyDuplicated(ids))

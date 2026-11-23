@@ -5,7 +5,8 @@ output_file  <- file.path(workflow_dir, "NIH_Results", "NIH_Report.xlsx")
 
 source(file.path(workflow_dir, "nih_research_workflow.R"), encoding = "UTF-8")
 
-# Pull settings. Edit keywords and aliases in NIH_Search_Inputs.xlsx.
+# EDIT YOUR PULL HERE. Save the file and click Source to run.
+# Select phrases using Enabled on the Keywords sheet. Edit pull settings below.
 settings <- nih_pull_settings(
   report_start_fy = 2024,
   report_end_fy   = 2027,
