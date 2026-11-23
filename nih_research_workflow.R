@@ -161,11 +161,17 @@ nih_request <- function(client, payload) {
       }
       if (!code %in% c(429, 500, 502, 503, 504)) httr::stop_for_status(response)
     }
-    if (attempt == 6L) abort("NIH request failed after retries. Rerun when the service is available.")
+    reason <- if (inherits(response, "error")) conditionMessage(response) else paste("HTTP", code)
+    if (attempt == 6L) {
+      years <- paste(unlist(payload$criteria$fiscal_years), collapse = ", ")
+      abort("RePORTER POST failed after 6 attempts: ", reason,
+            " [FY ", years, ", offset ", payload$offset %||% 0L,
+            ", limit ", payload$limit %||% 1L, "]")
+    }
     retry_after <- if (inherits(response, "error")) NA_real_ else
       suppressWarnings(as.numeric(httr::headers(response)[["retry-after"]]))
     wait <- max(c(min(2^attempt, 30), retry_after), na.rm = TRUE)
-    message("NIH request retry ", attempt, ". Waiting ", wait, " seconds.")
+    message("RePORTER attempt ", attempt, " failed: ", reason, ". Retrying in ", wait, " seconds.")
     Sys.sleep(wait)
   }
 }
