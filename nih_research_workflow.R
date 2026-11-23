@@ -44,49 +44,46 @@ read_input_sheet <- function(path, sheet, columns) {
     filter(if_any(everything(), ~!is.na(.x)))
 }
 
-read_nih_inputs <- function(path) {
-  settings <- read_input_sheet(path, "Settings", c("Setting", "Value", "Explanation"))
-  expected <- c("report_start_fy", "report_end_fy", "history_start_fy", "period_mode",
-                "through_mmdd", "activity_codes", "admin_institutes", "include_s10", "include_cash")
-  if (anyDuplicated(settings$Setting) || !setequal(settings$Setting, expected))
-    abort("Settings must contain each supplied setting exactly once.")
-  values <- setNames(settings$Value, settings$Setting)
-  year_value <- function(key) {
-    value <- values[[key]]
-    if (is.na(value) || !str_detect(value, "^[0-9]{4}$")) abort("Enter a four-digit year for ", key)
+nih_pull_settings <- function(report_start_fy, report_end_fy, history_start_fy, period_mode,
+                              through_mmdd, activity_codes, admin_institutes, include_s10,
+                              include_cash, search_fields) {
+  year_value <- function(value) {
+    if (length(value) != 1L || is.na(value) || !str_detect(as.character(value), "^[0-9]{4}$"))
+      abort("Fiscal years must be four-digit years in run_nih_report.R.")
     as.integer(value)
   }
-  config <- list(start = year_value("report_start_fy"), end = year_value("report_end_fy"),
-                 history = year_value("history_start_fy"), mode = toupper(values[["period_mode"]]),
-                 through = values[["through_mmdd"]])
+  if (!is.logical(include_s10) || length(include_s10) != 1L || is.na(include_s10) ||
+      !is.logical(include_cash) || length(include_cash) != 1L || is.na(include_cash))
+    abort("Set include_s10 and include_cash to TRUE or FALSE.")
+  search_fields <- match.arg(search_fields, c("Title + abstract", "Title", "All text"))
+  config <- list(start = year_value(report_start_fy), end = year_value(report_end_fy),
+                 history = year_value(history_start_fy), mode = toupper(period_mode),
+                 through = through_mmdd, include_s10 = include_s10, include_cash = include_cash,
+                 search_fields = search_fields)
   if (identical(toupper(config$through), "AUTO")) {
     # Use the same cutoff in every comparison year. February 28 is shared by all years.
     cutoff <- format(Sys.time(), "%m-%d", tz = "America/New_York")
     config$through <- if (cutoff == "02-29") "02-28" else cutoff
   }
   if (!(config$history >= 1985 && config$history <= config$start &&
-        config$start <= config$end && config$end <= fy_today())) abort("Check the fiscal-year sequence in Settings.")
+        config$start <= config$end && config$end <= fy_today())) abort("Check the fiscal-year sequence in run_nih_report.R.")
   if (!config$mode %in% c("FULL_FY", "YTD")) abort("period_mode must be FULL_FY or YTD.")
   if (config$mode == "FULL_FY" && config$end >= fy_today())
     abort("The final fiscal year is in progress. Select YTD and a through_mmdd cutoff.")
   if (config$mode == "YTD" && (is.na(config$through) ||
       !str_detect(config$through, "^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")))
     abort("For YTD, enter through_mmdd as text such as 10-31.")
-  split_codes <- function(key) {
-    z <- values[[key]]
-    if (is.na(z)) abort("Use ALL or comma-separated codes for ", key)
-    unique(str_split(toupper(z), "\\s*,\\s*")[[1]])
+  split_codes <- function(codes) {
+    if (!is.character(codes) || !length(codes) || anyNA(codes))
+      abort("Use ALL or a character vector of codes.")
+    codes |> str_split(",") |> unlist(use.names = FALSE) |> str_trim() |> toupper() |> unique()
   }
-  config$activities <- split_codes("activity_codes")
-  config$ics <- split_codes("admin_institutes")
+  config$activities <- split_codes(activity_codes)
+  config$ics <- split_codes(admin_institutes)
   if (identical(config$ics, "ALL")) config$ics <- nih_admin_codes
-  if (!all(config$ics %in% nih_admin_codes)) abort("Unknown administering institute code in Settings.")
+  if (!all(config$ics %in% nih_admin_codes)) abort("Unknown administering institute code in run_nih_report.R.")
   if (!identical(config$activities, "ALL") &&
       !all(str_detect(config$activities, "^[A-Z][0-9]{2}$"))) abort("Use activity codes such as R01,R21 or ALL.")
-  for (key in c("include_s10", "include_cash")) {
-    if (is.na(values[[key]]) || !toupper(values[[key]]) %in% c("YES", "NO")) abort(key, " must be Yes or No.")
-    config[[key]] <- toupper(values[[key]]) == "YES"
-  }
   periods <- tibble(fiscal_year = seq(config$history, config$end)) |>
     mutate(report_period = fiscal_year >= config$start,
       period_start = as.Date(sprintf("%d-10-01", fiscal_year - 1L)),
@@ -101,8 +98,14 @@ read_nih_inputs <- function(path) {
     if (any(periods$period_end[periods$report_period] > Sys.Date())) abort("The YTD cutoff is in the future.")
   }
   config$periods <- periods
+  config
+}
 
-  keywords <- read_input_sheet(path, "Keywords", c("Enabled", "Topic", "Ticker", "Kind", "Phrase", "Fields")) |>
+read_nih_inputs <- function(path, settings) {
+  if (missing(settings)) abort("Supply the pull settings from run_nih_report.R.")
+  config <- settings
+
+  keywords <- read_input_sheet(path, "Keywords", c("Enabled", "Topic", "Ticker", "Kind", "Phrase")) |>
     mutate(Enabled = str_to_upper(Enabled), Ticker = coalesce(Ticker, ""))
   if (anyNA(keywords$Enabled) || !all(keywords$Enabled %in% c("YES", "NO")))
     abort("Each Keywords row needs Enabled set to Yes or No.")
@@ -110,13 +113,12 @@ read_nih_inputs <- function(path) {
   if (!nrow(active)) abort("Enable at least one keyword row.")
   if (anyNA(active) || any(str_detect(active$Phrase, '["\\r\\n]')) ||
       any(str_length(active$Phrase) < 2)) abort("Complete enabled keyword rows. Enter a phrase without quotation marks.")
-  if (!all(active$Fields %in% c("Title + abstract", "Title", "All text"))) abort("Choose Fields from the dropdown.")
   if (!all(active$Kind %in% c("Platform", "Modality", "Diagnostics")))
     abort("Kind must be Platform, Modality or Diagnostics.")
   if (any(active$Topic == "__S10__")) abort("__S10__ is reserved for instrument reviews.")
   topics <- active |> distinct(Topic, Ticker, Kind)
   if (anyDuplicated(topics$Topic)) abort("Use the same Ticker and Kind for every alias of a Topic.")
-  active <- active |> mutate(search_field = recode(Fields, "Title + abstract" = "projecttitle,abstracttext",
+  active <- active |> mutate(Fields = config$search_fields, search_field = recode(Fields, "Title + abstract" = "projecttitle,abstracttext",
     "Title" = "projecttitle", "All text" = "all"))
   reviews <- read_input_sheet(path, "Reviews", c("Application ID", "Topic", "Decision",
     "Instrument", "Vendor", "Assessment", "Notes")) |>
@@ -886,8 +888,8 @@ save_nih_excel <- function(result, output_file) {
 
 # Extended export for existing callers that also use snapshots and the HTML briefing.
 run_nih <- function(input_file = "NIH_Search_Inputs.xlsx",
-                    output_dir = file.path(dirname(input_file), "NIH_Results")) {
-  inputs <- read_nih_inputs(input_file)
+                    output_dir = file.path(dirname(input_file), "NIH_Results"), settings) {
+  inputs <- read_nih_inputs(input_file, settings)
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   if (!dir.exists(output_dir)) abort("Cannot create the output folder.")
   # Review decisions are part of the scope so analyst edits cannot appear as NIH changes.
